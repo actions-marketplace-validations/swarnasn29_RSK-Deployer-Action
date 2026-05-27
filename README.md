@@ -74,9 +74,10 @@ Rootstock is EVM-compatible but has specific requirements that break standard Fo
 | `verifier_type` | ❌ | `blockscout` | Verification provider (`blockscout` or `etherscan`). When set to `etherscan`, `etherscan_api_key` is required. |
 | `gas_estimate_multiplier` | ❌ | `130` | Gas estimate buffer percentage (130 = 30% over estimate) |
 | `min_balance` | ❌ | `100000000000000` | Minimum deployer balance in wei required before deploy (0.0001 RBTC) |
-| `extra_args` | ❌ | `''` | Additional flags passed directly to `forge script`. Tokens are validated — shell metacharacters (`;`, `\|`, `&`, `$`, `` ` ``, `<`, `>`) and the flags `--private-key`, `--rpc-url`, `--legacy` are rejected. |
+| `extra_args` | ❌ | `''` | Additional flags passed directly to `forge script`. Tokens are split on whitespace then checked against an **allowlist** of safe forge flags (`--gas-limit`, `--gas-price`, `--priority-gas-price`, `--with-gas-price`, `--slow`, `--skip-simulation`, `--via-ir`, `--non-interactive`, `--resume`, `--delay`, `--retries`, `--code-size-limit`). Shell metacharacters (`;`, `\|`, `&`, `$`, `` ` ``, `<`, `>`) are also rejected. |
 | `strict_gas_check` | ❌ | `false` | Set to `true` to **fail the action** when gas price is anomalously low (below Rootstock's 60 Mwei minimum). Recommended for Mainnet deployments. |
-| `etherscan_api_key` | ❌ | `''` | Etherscan API key. **Required** when `verifier_type: etherscan`. Ignored when using `blockscout`. Always use `${{ secrets.ETHERSCAN_API_KEY }}`. |
+| `etherscan_api_key` | ❌ | `''` | Etherscan API key. **Required** when `verifier_type: etherscan` and `verify: true`. Ignored when using `blockscout` or when `verify: false`. Always use `${{ secrets.ETHERSCAN_API_KEY }}`. |
+| `verify` | ❌ | `true` | Set to `false` to skip `--verify` (useful for unverifiable contracts, local/anvil CI runs, or rapid iteration). |
 
 ## Outputs
 

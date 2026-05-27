@@ -49,7 +49,8 @@ VERIFIER_TYPE="${INPUT_VERIFIER_TYPE:-blockscout}"
 EXTRA_ARGS="${INPUT_EXTRA_ARGS:-}"
 CONTRACT_NAME="${INPUT_CONTRACT_NAME:-}"
 STRICT_GAS_CHECK="${INPUT_STRICT_GAS_CHECK:-false}"  # L-1: optional strict gas price enforcement
-ETHERSCAN_API_KEY="${INPUT_ETHERSCAN_API_KEY:-}"      # L-2: real key required when verifier_type=etherscan
+ETHERSCAN_API_KEY="${INPUT_ETHERSCAN_API_KEY:-}"      # L-2: real key required when verifier_type=etherscan AND verify=true
+VERIFY="${INPUT_VERIFY:-true}"                        # N-10: allow skipping --verify (anvil/CI, unverifiable contracts)
 
 # ── Basic Input Validation ──────────────────────────────────────────────────
 
@@ -72,11 +73,15 @@ if [[ ! "$VERIFIER_TYPE" =~ ^(blockscout|etherscan)$ ]]; then
     error "verifier_type must be 'blockscout' or 'etherscan'"
     exit 1
 fi
+if [[ ! "$VERIFY" =~ ^(true|false)$ ]]; then
+    error "verify must be 'true' or 'false'"
+    exit 1
+fi
 
-# L-2: When verifier_type is etherscan, a real API key is required.
-if [[ "$VERIFIER_TYPE" == "etherscan" && -z "$ETHERSCAN_API_KEY" ]]; then
+# L-2: When verifier_type is etherscan AND verification is enabled, a real key is required.
+if [[ "$VERIFIER_TYPE" == "etherscan" && "$VERIFY" == "true" && -z "$ETHERSCAN_API_KEY" ]]; then
     error "verifier_type is set to 'etherscan' but etherscan_api_key is not provided."
-    error "Please add the 'etherscan_api_key' input or switch verifier_type back to 'blockscout'."
+    error "Please add the 'etherscan_api_key' input, switch verifier_type back to 'blockscout', or set verify: 'false'."
     exit 1
 fi
 
@@ -88,13 +93,57 @@ if [[ -n "$CONTRACT_NAME" ]] && [[ ! "$CONTRACT_NAME" =~ ^[a-zA-Z_][a-zA-Z0-9_]*
     exit 1
 fi
 
-# H-2: Safe tokenization of extra_args.
-# Use read -ra to split on IFS (word-boundary safe) instead of unquoted
-# expansion ($EXTRA_ARGS). We also reject any token that contains shell
-# metacharacters (;, |, &, $, backtick, <, >) or the forbidden flag names.
+# M-1 / N-6: Path traversal guard on script_path — runs BEFORE any RPC call so
+# bad input fails fast without burning network resources on chain detection,
+# gas price, or balance lookups.
+if [[ "$INPUT_SCRIPT_PATH" == *".."* ]]; then
+    error "script_path must not contain '..' (path traversal detected): ${INPUT_SCRIPT_PATH}"
+    exit 1
+fi
+# Additionally resolve against GITHUB_WORKSPACE when available
+if [[ -n "${GITHUB_WORKSPACE:-}" ]]; then
+    _resolved=$(realpath -m "${GITHUB_WORKSPACE}/${INPUT_SCRIPT_PATH}" 2>/dev/null || echo "")
+    if [[ -n "$_resolved" && "$_resolved" != "${GITHUB_WORKSPACE}"* ]]; then
+        error "script_path resolves outside the workspace directory. Aborting."
+        exit 1
+    fi
+fi
+
+# H-2 / N-1: Safe tokenization of extra_args via allowlist.
+# Note: this tokenizer splits on whitespace via `read -ra`. It does NOT honour
+# shell quoting (e.g. `--arg "a b"` is split into three tokens) — that is by
+# design, since honouring quoting would require `eval` which re-introduces the
+# injection surface we're trying to close.
+#
+# Two-layer defence applied to every token:
+#   1. Reject any token containing shell metacharacters (;, |, &, $, `, <, >).
+#   2. If the token starts with `--`, it MUST appear in EXTRA_ARGS_FLAG_ALLOWLIST.
+#      Non-flag tokens (flag values, positional args) are accepted after the
+#      metacharacter check, so e.g. `--gas-price 100000000` works as expected.
+#
+# The allowlist (N-1) explicitly excludes verification-redirect flags
+# (--verifier, --verifier-url) which would otherwise enable source-code
+# exfiltration via forge's "last-flag-wins" semantics, as well as alternative
+# signing-source flags (--keystore, --mnemonic, --unlocked, --ledger, etc.) and
+# network-redirect flags (--fork-url).
+EXTRA_ARGS_FLAG_ALLOWLIST=(
+    --gas-limit
+    --gas-price
+    --priority-gas-price
+    --with-gas-price
+    --slow
+    --skip-simulation
+    --via-ir
+    --non-interactive
+    --resume
+    --delay
+    --retries
+    --code-size-limit
+)
+
 EXTRA_ARGS_ARRAY=()
 if [[ -n "$EXTRA_ARGS" ]]; then
-    # Tokenize properly, respecting quoting boundaries
+    # Split on whitespace, then reject any token containing shell metacharacters.
     IFS=' ' read -ra _raw_tokens <<< "$EXTRA_ARGS"
     for _token in "${_raw_tokens[@]}"; do
         # Reject shell metacharacters that could enable command injection
@@ -103,13 +152,24 @@ if [[ -n "$EXTRA_ARGS" ]]; then
             error "Allowed characters exclude: ; | & \$ \` < >"
             exit 1
         fi
-        # Reject managed flags that must not be overridden
-        case "$_token" in
-            --private-key|--rpc-url|--legacy)
-                error "extra_args contains forbidden flag '${_token}'. This flag is managed by the action."
+        # For flag tokens (start with --) enforce allowlist
+        if [[ "$_token" == --* ]]; then
+            # Strip any =value suffix so --gas-price=100 still matches --gas-price
+            _flag_name="${_token%%=*}"
+            _allowed=0
+            for _allowed_flag in "${EXTRA_ARGS_FLAG_ALLOWLIST[@]}"; do
+                if [[ "$_flag_name" == "$_allowed_flag" ]]; then
+                    _allowed=1
+                    break
+                fi
+            done
+            if [[ "$_allowed" -eq 0 ]]; then
+                error "extra_args flag '${_flag_name}' is not in the allowlist."
+                error "Permitted flags: ${EXTRA_ARGS_FLAG_ALLOWLIST[*]}"
+                error "Action-managed flags (--private-key, --rpc-url, --legacy, --verifier, --verifier-url, --etherscan-api-key, --target-contract) and signing-source flags (--keystore, --mnemonic, --unlocked, --ledger, --trezor, --aws, --fork-url) are explicitly forbidden."
                 exit 1
-                ;;
-        esac
+            fi
+        fi
         EXTRA_ARGS_ARRAY+=("$_token")
     done
 fi
@@ -190,6 +250,15 @@ if [[ "$CURRENT_GAS_PRICE" == "0" || -z "$CURRENT_GAS_PRICE" ]]; then
     CURRENT_GAS_PRICE=0
 fi
 
+# N-4: Defence-in-depth — reject non-numeric gas price values before they flow
+# into bc / bash arithmetic. A compromised RPC returning crafted input could
+# otherwise poison downstream math (Debian's bc lacks system() so direct RCE
+# isn't reachable, but we want a hard guardrail regardless).
+if ! [[ "$CURRENT_GAS_PRICE" =~ ^[0-9]+$ ]]; then
+    error "RPC returned a non-numeric gas price: '${CURRENT_GAS_PRICE}'. Aborting."
+    exit 1
+fi
+
 # Rootstock minimum gas price is typically 0.06 Gwei = 60000000 wei
 MIN_GAS_PRICE=60000000
 
@@ -237,6 +306,12 @@ if [[ -z "$RAW_BALANCE" ]]; then
     exit 1
 fi
 
+# N-4: Defence-in-depth — reject non-numeric balance before it reaches bc.
+if ! [[ "$RAW_BALANCE" =~ ^[0-9]+$ ]]; then
+    error "RPC returned a non-numeric balance: '${RAW_BALANCE}'. Aborting."
+    exit 1
+fi
+
 success "Balance: ${RAW_BALANCE} wei"
 
 # Numeric comparison using bash arithmetic (handles large integers safely with bc)
@@ -271,28 +346,13 @@ info "━━━━━━━━━━━━━━━━━━━━━━━━�
 info "🚀  Deploying to ${NETWORK_NAME}..."
 info "    Script:              ${INPUT_SCRIPT_PATH}"
 info "    Gas multiplier:      ${GAS_MULTIPLIER}%"
-info "    Verifier:            ${VERIFIER_TYPE}"
+info "    Verifier:            ${VERIFIER_TYPE} (verify=${VERIFY})"
 info "    Transaction type:    Legacy (EIP-155 forced for Rootstock)"
 info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# M-1: Path traversal guard on script_path.
-# Reject any path that contains '..' segments to prevent referencing files
-# outside the workspace. Within GitHub Actions the blast radius is limited to
-# the checked-out repo, but defense-in-depth requires explicit validation.
-if [[ "$INPUT_SCRIPT_PATH" == *".."* ]]; then
-    error "script_path must not contain '..' (path traversal detected): ${INPUT_SCRIPT_PATH}"
-    exit 1
-fi
-# Additionally resolve against GITHUB_WORKSPACE when available
-if [[ -n "${GITHUB_WORKSPACE:-}" ]]; then
-    _resolved=$(realpath -m "${GITHUB_WORKSPACE}/${INPUT_SCRIPT_PATH}" 2>/dev/null || echo "")
-    if [[ -n "$_resolved" && "$_resolved" != "${GITHUB_WORKSPACE}"* ]]; then
-        error "script_path resolves outside the workspace directory. Aborting."
-        exit 1
-    fi
-fi
-
 # Build the forge command. Using an array avoids word-splitting issues.
+# N-6: script_path traversal is validated in the early input validation block
+# above, before any RPC calls.
 FORGE_CMD=(
     forge script "$INPUT_SCRIPT_PATH"
     --rpc-url "$INPUT_RPC_URL"
@@ -300,19 +360,29 @@ FORGE_CMD=(
     --private-key "$INPUT_PRIVATE_KEY"
     --legacy
     --gas-estimate-multiplier "$GAS_MULTIPLIER"
-    --verify
-    --verifier "$VERIFIER_TYPE"
-    --verifier-url "$EXPLORER_API"
 )
 
 # Append contract name if provided (targeted verification).
 # M-3: contract_name is already validated as a Solidity identifier above.
-# L-2: Only pass --etherscan-api-key for blockscout (which accepts "none");
-#       for etherscan, pass the real key validated at startup.
 if [[ -n "$CONTRACT_NAME" ]]; then
     FORGE_CMD+=(--target-contract "$CONTRACT_NAME")
+fi
+
+# N-10: --verify (and its sibling flags) are opt-out via the `verify` input so
+# that the action remains usable against anvil and other unverified targets.
+if [[ "$VERIFY" == "true" ]]; then
+    FORGE_CMD+=(
+        --verify
+        --verifier "$VERIFIER_TYPE"
+        --verifier-url "$EXPLORER_API"
+    )
+    # L-2 / N-2: Verifier API key is independent of contract_name.
+    # - Blockscout: forge's --verify flow accepts "none" as a sentinel and skips key auth.
+    # - Etherscan:  the real key is required (validated at startup) and is appended
+    #   here unconditionally so single-contract scripts using auto-detection still
+    #   verify successfully.
     if [[ "$VERIFIER_TYPE" == "blockscout" ]]; then
-        FORGE_CMD+=(--etherscan-api-key "none")  # Blockscout does not require a real key
+        FORGE_CMD+=(--etherscan-api-key "none")
     else
         FORGE_CMD+=(--etherscan-api-key "$ETHERSCAN_API_KEY")
     fi

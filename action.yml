@@ -80,11 +80,20 @@ inputs:
   etherscan_api_key:
     description: |
       API key for Etherscan-compatible verification endpoints.
-      REQUIRED when verifier_type is set to 'etherscan'.
+      REQUIRED when verifier_type is set to 'etherscan' AND verify is 'true'.
       Ignored (and not passed to forge) when verifier_type is 'blockscout' (L-2).
       Always reference via secrets: ${{ secrets.ETHERSCAN_API_KEY }}
     required: false
     default: ''
+
+  verify:
+    description: |
+      When 'true' (default), the action runs forge with --verify against the
+      configured verifier (Blockscout or Etherscan). Set to 'false' to skip
+      verification — useful for local/anvil CI runs, unverifiable contracts,
+      or rapid testnet iteration where verification noise is unwanted.
+    required: false
+    default: 'true'
 
 # ─────────────────────────────────────────────
 #  OUTPUTS
@@ -119,3 +128,4 @@ runs:
     INPUT_EXTRA_ARGS: ${{ inputs.extra_args }}
     INPUT_STRICT_GAS_CHECK: ${{ inputs.strict_gas_check }}
     INPUT_ETHERSCAN_API_KEY: ${{ inputs.etherscan_api_key }}
+    INPUT_VERIFY: ${{ inputs.verify }}

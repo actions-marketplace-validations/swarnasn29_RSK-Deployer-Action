@@ -12,9 +12,10 @@
 #    3. Replace the sha256 hash below and update the date comment.
 #    4. Commit and open a PR — renovate-bot can automate this.
 #
-#  Pinned: 2026-04-10 | ghcr.io/foundry-rs/foundry:latest
+#  Pinned: 2026-05-27 | ghcr.io/foundry-rs/foundry:latest
+#  (multi-arch index digest from `docker buildx imagetools inspect`)
 # ============================================================
-FROM ghcr.io/foundry-rs/foundry:latest@sha256:89a052af62c612d0e05d2596f03edba77d7d904c4478b387a5dc6305821fe0a1
+FROM ghcr.io/foundry-rs/foundry:latest@sha256:8347b728d5d393dac1c018691b36f506d23b9dcd78341d40ea0fcb11c3a19cdd
 LABEL org.opencontainers.image.title="Rootstock Foundry Deployer"
 LABEL org.opencontainers.image.description="GitHub Action for deploying Foundry smart contracts to Rootstock (Mainnet/Testnet)"
 LABEL org.opencontainers.image.source="https://github.com/rsksmart/rootstock-foundry-action"
