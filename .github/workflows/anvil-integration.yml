@@ -1,0 +1,190 @@
+# ─────────────────────────────────────────────────────────────────
+#  anvil-integration.yml — N-10 fix
+#
+#  Spins up a local Anvil node masquerading as Rootstock Testnet
+#  (chain-id 31) and exercises the action end-to-end against it.
+#
+#  What this catches that the build/lint jobs do not:
+#    - L-2 / N-2 regression: --etherscan-api-key wiring when
+#      verifier_type=etherscan even with no contract_name.
+#    - M-1 path traversal: GITHUB_WORKSPACE is exercised here.
+#    - Heredoc output format (M-2 / N-3): assertions parse the
+#      key<<_EOF_DELIM_ form, not the legacy key=value form.
+#    - Full extract-from-broadcast-log pipeline (jq, CREATE tx).
+#
+#  Anvil's account 0 is pre-funded with 10000 ETH; its private key
+#  is the documented anvil default (NOT a secret).
+#
+#  Implementation note: we invoke the container directly with
+#  `docker run` (the same pattern as test-local.sh) instead of
+#  `uses: ./` because the action's docker mount pins cwd to the
+#  runner workspace, and we need to run forge inside a fixture
+#  subdirectory without polluting the action repo root.
+# ─────────────────────────────────────────────────────────────────
+name: Anvil Integration Test
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  anvil-deploy:
+    name: End-to-end deploy against local Anvil
+    runs-on: ubuntu-latest
+    env:
+      ANVIL_PRIVATE_KEY: '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80'
+      ANVIL_RPC_URL: 'http://172.17.0.1:8545'
+      IMAGE_TAG: 'rootstock-foundry-action:ci'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Foundry (for anvil + forge init)
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Build the action container
+        run: docker build -t "$IMAGE_TAG" .
+
+      - name: Start Anvil (chain-id 31)
+        run: |
+          # Bind to all interfaces so the container can reach it via the docker bridge.
+          nohup anvil --chain-id 31 --host 0.0.0.0 --port 8545 \
+            --gas-price 65000000 > anvil.log 2>&1 &
+          for _i in {1..20}; do
+            if cast chain-id --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1; then
+              echo "Anvil up"; break
+            fi
+            sleep 1
+          done
+          cast chain-id --rpc-url http://127.0.0.1:8545
+
+      - name: Bootstrap a minimal Foundry project
+        run: |
+          mkdir -p anvil-fixture && cd anvil-fixture
+          forge init --no-git --force
+          cat > src/Counter.sol <<'SOL'
+          // SPDX-License-Identifier: MIT
+          pragma solidity ^0.8.19;
+          contract Counter {
+              uint256 public number;
+              function setNumber(uint256 n) external { number = n; }
+          }
+          SOL
+          cat > script/Counter.s.sol <<'SOL'
+          // SPDX-License-Identifier: MIT
+          pragma solidity ^0.8.19;
+          import {Script} from "forge-std/Script.sol";
+          import {Counter} from "../src/Counter.sol";
+          contract CounterScript is Script {
+              function run() external {
+                  vm.startBroadcast();
+                  new Counter();
+                  vm.stopBroadcast();
+              }
+          }
+          SOL
+          touch outputs.txt
+
+      - name: Positive path — deploy via container (verify=false)
+        run: |
+          set -euo pipefail
+          FIXTURE="$GITHUB_WORKSPACE/anvil-fixture"
+          docker run --rm \
+            --add-host host.docker.internal:host-gateway \
+            -v "$FIXTURE":/github/workspace \
+            -v "$FIXTURE/outputs.txt":/github/outputs.txt \
+            -w /github/workspace \
+            -e INPUT_RPC_URL="$ANVIL_RPC_URL" \
+            -e INPUT_PRIVATE_KEY="$ANVIL_PRIVATE_KEY" \
+            -e INPUT_SCRIPT_PATH="script/Counter.s.sol" \
+            -e INPUT_VERIFY="false" \
+            -e INPUT_MIN_BALANCE="1000000000000000000" \
+            -e GITHUB_OUTPUT="/github/outputs.txt" \
+            -e GITHUB_WORKSPACE="/github/workspace" \
+            "$IMAGE_TAG"
+
+      - name: Assert heredoc outputs are well-formed
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/anvil-fixture/outputs.txt"
+          echo "=== outputs.txt ==="; cat "$OUT"; echo "==================="
+
+          assert_heredoc() {
+            local key="$1" pattern="$2"
+            if ! grep -qE "^${key}<<_EOF_DELIM_$" "$OUT"; then
+              echo "Missing ${key} heredoc opener"; exit 1
+            fi
+            local val
+            val=$(awk -v k="^${key}<<_EOF_DELIM_$" '$0 ~ k { getline; print; exit }' "$OUT")
+            if ! [[ "$val" =~ $pattern ]]; then
+              echo "Bad ${key}: '${val}' does not match ${pattern}"; exit 1
+            fi
+            echo "  ${key} = ${val}"
+          }
+          assert_heredoc contract_address '^0x[0-9a-fA-F]{40}$'
+          assert_heredoc transaction_hash '^0x[0-9a-fA-F]{64}$'
+          assert_heredoc chain_id         '^31$'
+          assert_heredoc explorer_url     '^https://explorer\.testnet\.rootstock\.io/address/0x[0-9a-fA-F]{40}$'
+          echo "All heredoc outputs validated."
+
+      - name: Negative path — etherscan verifier requires api key (L-2/N-2)
+        run: |
+          set +e
+          FIXTURE="$GITHUB_WORKSPACE/anvil-fixture"
+          touch "$FIXTURE/outputs2.txt"
+          docker run --rm \
+            --add-host host.docker.internal:host-gateway \
+            -v "$FIXTURE":/github/workspace \
+            -v "$FIXTURE/outputs2.txt":/github/outputs.txt \
+            -w /github/workspace \
+            -e INPUT_RPC_URL="$ANVIL_RPC_URL" \
+            -e INPUT_PRIVATE_KEY="$ANVIL_PRIVATE_KEY" \
+            -e INPUT_SCRIPT_PATH="script/Counter.s.sol" \
+            -e INPUT_VERIFIER_TYPE="etherscan" \
+            -e INPUT_VERIFY="true" \
+            -e GITHUB_OUTPUT="/github/outputs.txt" \
+            "$IMAGE_TAG" > neg.log 2>&1
+          rc=$?
+          set -e
+          cat neg.log
+          if [[ $rc -eq 0 ]]; then
+            echo "Expected non-zero exit but action succeeded"; exit 1
+          fi
+          grep -q "etherscan_api_key is not provided" neg.log \
+            || { echo "Missing expected error message"; exit 1; }
+          echo "L-2 / N-2 regression guard OK"
+
+      - name: Negative path — path traversal rejected (M-1/N-6)
+        run: |
+          set +e
+          FIXTURE="$GITHUB_WORKSPACE/anvil-fixture"
+          touch "$FIXTURE/outputs3.txt"
+          docker run --rm \
+            --add-host host.docker.internal:host-gateway \
+            -v "$FIXTURE":/github/workspace \
+            -v "$FIXTURE/outputs3.txt":/github/outputs.txt \
+            -w /github/workspace \
+            -e INPUT_RPC_URL="$ANVIL_RPC_URL" \
+            -e INPUT_PRIVATE_KEY="$ANVIL_PRIVATE_KEY" \
+            -e INPUT_SCRIPT_PATH="../etc/passwd" \
+            -e INPUT_VERIFY="false" \
+            -e GITHUB_OUTPUT="/github/outputs.txt" \
+            "$IMAGE_TAG" > trav.log 2>&1
+          rc=$?
+          set -e
+          cat trav.log
+          if [[ $rc -eq 0 ]]; then
+            echo "Expected non-zero exit on path traversal"; exit 1
+          fi
+          grep -q "path traversal detected" trav.log \
+            || { echo "Missing expected traversal error message"; exit 1; }
+          echo "M-1 / N-6 path traversal guard OK"
+
+      - name: Dump anvil log on failure
+        if: failure()
+        run: cat anvil.log || true

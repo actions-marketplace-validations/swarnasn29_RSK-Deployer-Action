@@ -61,6 +61,18 @@ jobs:
           gas_estimate_multiplier: '130'             # 30% buffer (default)
           min_balance:             '100000000000000'    # 0.0001 RBTC (default)
 
+          # ── Optional: strict gas-price safety (recommended for Mainnet) ─
+          # When 'true', the action FAILS if the network gas price is below
+          # Rootstock's 60 Mwei minimum — a strong signal that the RPC node
+          # is out of sync. Leave 'false' on Testnet for permissive runs.
+          # strict_gas_check: 'true'
+
+          # ── Optional: Etherscan-style verifier ──────────────────────────
+          # Switch verifier_type to 'etherscan' (e.g. Routescan, Etherscan-compatible
+          # explorers) and provide a real API key. Defaults to Blockscout otherwise.
+          # verifier_type:     'etherscan'
+          # etherscan_api_key: ${{ secrets.ETHERSCAN_API_KEY }}
+
           # ── Optional: additional forge flags ────────────────────────────
           # extra_args: '--slow'    # Add --slow for congested networks
 

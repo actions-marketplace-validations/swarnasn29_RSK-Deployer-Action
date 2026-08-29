@@ -4,7 +4,9 @@
 #  Simulates how GitHub Actions executes the Docker container.
 # =============================================================================
 
-set -e
+# N-8: parity with production entrypoint.sh — catch unset variables and
+# pipefail failures that would otherwise silently mask regressions.
+set -euo pipefail
 
 # Colors
 GREEN='\033[0;32m'
@@ -16,7 +18,7 @@ NC='\033[0m'
 echo -e "${CYAN}=== Rootstock Foundry Action Local Tester ===${NC}"
 
 # 1. Require a test private key
-if [ -z "$TEST_PRIVATE_KEY" ]; then
+if [ -z "${TEST_PRIVATE_KEY:-}" ]; then
     echo -e "${YELLOW}Warning: TEST_PRIVATE_KEY environment variable is not set.${NC}"
     echo -e "You can still run this, but it will fail at the 'Deployer Balance Check' step."
     echo -e "To do a full deployment test, run via:"
@@ -105,10 +107,33 @@ echo -e "\n${CYAN}>> Checking Outputs...${NC}"
 cat "$DUMMY_DIR/outputs.txt" || true
 
 if [ "$TEST_PRIVATE_KEY" != "0x0000000000000000000000000000000000000000000000000000000000000001" ]; then
-    grep "contract_address=" "$DUMMY_DIR/outputs.txt" || { echo -e "${RED}Missing contract_address${NC}"; exit 1; }
-    grep "transaction_hash=" "$DUMMY_DIR/outputs.txt" || { echo -e "${RED}Missing transaction_hash${NC}"; exit 1; }
-    grep "chain_id=" "$DUMMY_DIR/outputs.txt" || { echo -e "${RED}Missing chain_id${NC}"; exit 1; }
-    grep "explorer_url=" "$DUMMY_DIR/outputs.txt" || { echo -e "${RED}Missing explorer_url${NC}"; exit 1; }
+    # N-3: entrypoint.sh writes outputs in the GitHub-recommended heredoc form
+    #   key<<_EOF_DELIM_
+    #   value
+    #   _EOF_DELIM_
+    # so the assertions match the heredoc opening line and then verify the
+    # value on the following line is non-empty.
+    assert_output() {
+        local _key="$1"
+        if ! grep -qE "^${_key}<<_EOF_DELIM_$" "$DUMMY_DIR/outputs.txt"; then
+            echo -e "${RED}Missing ${_key} heredoc in outputs.txt${NC}"
+            exit 1
+        fi
+        # Extract the value line (the line immediately following the opener)
+        # and verify it is non-empty.
+        local _value
+        _value=$(awk -v k="^${_key}<<_EOF_DELIM_$" '
+            $0 ~ k { getline; print; exit }
+        ' "$DUMMY_DIR/outputs.txt")
+        if [ -z "$_value" ] || [ "$_value" = "_EOF_DELIM_" ]; then
+            echo -e "${RED}Empty value for ${_key}${NC}"
+            exit 1
+        fi
+    }
+    assert_output "contract_address"
+    assert_output "transaction_hash"
+    assert_output "chain_id"
+    assert_output "explorer_url"
     echo -e "${GREEN}All outputs validated successfully.${NC}"
 fi
 
